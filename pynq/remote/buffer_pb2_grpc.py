@@ -3,7 +3,7 @@
 import grpc
 import warnings
 
-from pynq.remote import buffer_pb2 as buffer__pb2
+from . import buffer_pb2 as buffer__pb2
 
 GRPC_GENERATED_VERSION = '1.64.0'
 GRPC_VERSION = grpc.__version__

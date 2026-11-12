@@ -1,7 +1,7 @@
 #!/bin/bash
 
 set -x
-set -e
+set -eo pipefail
 
 target=$1
 pynqoverlays_dir=$target/usr/local/share/pynq-venv/lib/python3.12/site-packages/pynq/overlays
@@ -9,6 +9,7 @@ script_dir="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 
 # 1. Copy files from build area to the qemu environment
 sudo git clone --recursive $BUILD_ROOT/PYNQ  $target/home/xilinx/pynq_git
+git -C "$ROOTDIR/.." diff HEAD --binary | sudo git -C "$target/home/xilinx/pynq_git" apply --allow-empty
 sudo mkdir -p $target/home/xilinx/pynq_git/dist
 
 sudo cp $script_dir/pynq_hostname.sh $target/usr/local/bin

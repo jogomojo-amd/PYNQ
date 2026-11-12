@@ -186,10 +186,7 @@ class BitstreamHandler:
 
     def is_xsa(self):
         """Returns true if this is an XSA file, false otherwise"""
-        xsa_file = self._filepath.with_suffix(".xsa")
-        if xsa_file.exists():
-            return True
-        return False
+        return self._filepath.suffix == ".xsa"
 
     def _cache_exists(self)->bool:
         """ Checks to see if this bitstream is already on the system and
@@ -262,28 +259,31 @@ class BitstreamHandler:
                     raise RuntimeError(f"Unable to parse metadata")
 
             if xclbin_data is None:
-                xclbin_data = _create_xclbin(parser.mem_dict)
+                xclbin_data = self._create_xclbin(parser, partial)
             xclbin_parser = XclBin(xclbin_data=xclbin_data)
             _unify_dictionaries(parser, xclbin_parser)
 
             if not partial:
                 parser.refresh_hierarchy_dict()
-        elif xclbin_data is not None:
-            parser = XclBin(xclbin_data=xclbin_data)
         elif is_xsa:
             parser = RuntimeMetadataParser(Metadata(input=self._filepath))
             if xclbin_data is None:
-                xclbin_data = _create_xclbin(parser.mem_dict)
+                xclbin_data = self._create_xclbin(parser, partial)
             xclbin_parser = XclBin(xclbin_data=xclbin_data)
             _unify_dictionaries(parser, xclbin_parser)
             parser.refresh_hierarchy_dict()
             self._xsa_bitstream_file = parser.xsa._primaryProgrammableImagePath()
+        elif xclbin_data is not None:
+            parser = XclBin(xclbin_data=xclbin_data)
         else:
             return None
         parser.bin_data = self.get_bin_data()
         parser.xclbin_data = xclbin_data
         parser.dtbo_data = self.get_dtbo_data()
         return parser
+
+    def _create_xclbin(self, parser, partial):
+        return _create_xclbin(parser.mem_dict)
 
 
 class BitfileHandler(BitstreamHandler):
@@ -649,6 +649,14 @@ class EmbeddedDevice(XrtDevice):
 
             parser = XclBin(xclbin_data=DEFAULT_XCLBIN)
 
+        if bitstream.partial:
+            current = {(m.get("base_address", m.get("phys_addr")),
+                        m.get("size", m.get("addr_range"))) for m in self.mem_dict.values()}
+            for memory in parser.mem_dict.values():
+                if not memory.get("dfx") and (memory.get("base_address", memory.get("phys_addr")),
+                                             memory.get("size", memory.get("addr_range"))) not in current:
+                    raise RuntimeError("Partial overlays cannot change the memory topology")
+
         if not bitstream.binfile_name:
             _preload_binfile(bitstream, parser)
 
@@ -664,7 +672,8 @@ class EmbeddedDevice(XrtDevice):
 
         self.set_axi_port_width(parser)
 
-        self._xrt_download(parser.xclbin_data)
+        if not bitstream.partial:
+            self._xrt_download(parser.xclbin_data, bitstream.bitfile_name)
         super().post_download(bitstream, parser, self.name)
 
     def get_bitfile_metadata(self, bitfile_name:str, partial:bool=False):

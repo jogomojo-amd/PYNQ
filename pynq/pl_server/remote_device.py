@@ -1,4 +1,7 @@
 import os
+import copy
+import json
+import uuid
 import posixpath
 from pathlib import Path
 import pickle
@@ -8,14 +11,13 @@ import warnings
 import numpy as np
 
 import pynq._3rdparty.tinynumpy as tnp
+from pynq.buffer import PynqBuffer
 from pynq.devicetree import SYSTEM_DEVICE_TREE_PATH, DeviceTreeSegment
-from pynqmetadata.views.runtime import RuntimeMetadataParser
-from pynqmetadata.frontends import Metadata
 from .arch import VersalArch, ZynqArch, ZynqUltrascaleArch, _arch_class
 from .device import Device
 from .embedded_device import (
-    _unify_dictionaries, DEFAULT_XCLBIN, CacheMetadataError,
-    BitstreamHandler, bit2bin,
+    DEFAULT_XCLBIN,
+    BitstreamHandler, XclbinHandler, bit2bin, _ip_to_topology,
 )
 from .global_state import (
     GlobalState,
@@ -67,67 +69,16 @@ class RemoteBitstreamHandler(BitstreamHandler):
     """Remote bitstream handler for processing bitstreams on remote devices
     
     Extends BitstreamHandler to handle bitstream parsing and metadata extraction
-    for remote PYNQ devices. Uses default XCLBIN data for remote operations.
+    for remote PYNQ devices. Synthetic XCLBINs are generated on the board.
     """
     
-    def __init__(self, filepath, device_tag=""):
+    def __init__(self, filepath, device_tag="", device=None):
         super().__init__(filepath, device_tag)
+        self._device = device
 
-    def get_parser(self, partial:bool=False):
-        """Returns a parser object for the remote bitstream
+    def _create_xclbin(self, parser, partial):
+        return self._device._generate_xclbin(parser, self._filepath, partial)
 
-        The returned object contains all of the data that
-        was processed from both the HWH and Xclbin metadata
-        attached to the object. For remote devices, uses
-        default XCLBIN data instead of creating synthetic data.
-
-        Parameters
-        ----------
-        partial : bool, optional
-            Whether this is a partial reconfiguration bitstream.
-            Default is False.
-
-        Returns
-        -------
-        parser : object or None
-            Parser object containing metadata, or None if parsing fails
-        """
-        from .hwh_parser import HWH
-        from .xclbin_parser import XclBin
-
-        hwh_data = self.get_hwh_data()
-        xclbin_data = DEFAULT_XCLBIN
-        is_xsa = self.is_xsa()
-        self._xsa_bitstream_file = None
-        if hwh_data is not None and not is_xsa:
-
-            if partial:
-                parser = HWH(hwh_data=hwh_data)
-            else:
-                try:
-                    parser = self._get_cache() 
-                except CacheMetadataError:
-                    parser = RuntimeMetadataParser(Metadata(input=self._filepath.with_suffix(".hwh")))
-                except:
-                    raise RuntimeError(f"Unable to parse metadata")
-
-            xclbin_parser = XclBin(xclbin_data=xclbin_data)
-            _unify_dictionaries(parser, xclbin_parser)
-
-            if not partial:
-                parser.refresh_hierarchy_dict()
-        elif is_xsa:
-            parser = RuntimeMetadataParser(Metadata(input=self._filepath))
-            xclbin_parser = XclBin(xclbin_data=xclbin_data)
-            _unify_dictionaries(parser, xclbin_parser)
-            parser.refresh_hierarchy_dict()
-            self._xsa_bitstream_file = parser.xsa._primaryProgrammableImagePath()
-        else:
-            return None
-        parser.bin_data = self.get_bin_data()
-        parser.xclbin_data = xclbin_data
-        parser.dtbo_data = self.get_dtbo_data()
-        return parser
 
 class RemoteBitfileHandler(RemoteBitstreamHandler):
     def get_bin_data(self):
@@ -141,6 +92,16 @@ class RemoteBinfileHandler(RemoteBitstreamHandler):
 class RemotePdifileHandler(RemoteBinfileHandler):
     pass
 
+class RemoteXclbinHandler(RemoteBitstreamHandler, XclbinHandler):
+    def __init__(self, filepath, device_tag="", device=None):
+        XclbinHandler.__init__(self, filepath)
+        self._device_tag = device_tag
+        self._device = device
+
+    get_bin_data = XclbinHandler.get_bin_data
+    get_xclbin_data = XclbinHandler.get_xclbin_data
+
+
 class RemoteXsafileHandler(RemoteBitstreamHandler):
     def get_bin_data(self):
         if self._xsa_bitstream_file is None:
@@ -153,14 +114,34 @@ _bitstream_handlers = {
     ".bin": RemoteBinfileHandler,
     ".xsa": RemoteXsafileHandler,
     ".pdi": RemotePdifileHandler,
+    ".xclbin": RemoteXclbinHandler,
 }
 
 
-def _get_bitstream_handler(bitfile_name, device_tag=""):
+def _get_bitstream_handler(bitfile_name, device_tag="", device=None):
     filetype = Path(bitfile_name).suffix
     if filetype not in _bitstream_handlers:
         raise RuntimeError("Unknown file format")
-    return _bitstream_handlers[filetype](bitfile_name, device_tag)
+    return _bitstream_handlers[filetype](bitfile_name, device_tag, device)
+
+class _RegisterUpdates:
+    def __init__(self, device):
+        self.device = device
+        self.values = {}
+        self.updates = {}
+
+    def has_capability(self, capability):
+        return capability == "REGISTER_RW"
+
+    def read_registers(self, address, length):
+        if address not in self.values:
+            self.values[address] = self.device.mmap(address, length).read(0, length)
+        return self.values[address].to_bytes(length, "little")
+
+    def write_registers(self, address, data):
+        self.values[address] = int.from_bytes(data, "little")
+        self.updates[address] = self.values[address]
+
 
 class RemoteDevice(Device):
     """Device class for interacting with remote PYNQ devices via gRPC
@@ -169,7 +150,7 @@ class RemoteDevice(Device):
     It provides bitstream downloading, memory allocation, MMIO operations,
     and other PYNQ functionality through gRPC remote procedure calls.
 
-    The device supports multiple bitstream formats (.bit, .bin, .xsa) and
+    The device supports multiple bitstream formats (.bit, .bin, .pdi, .xsa, .xclbin) and
     handles metadata parsing, caching, and AXI port width configuration
     remotely.
 
@@ -196,6 +177,7 @@ class RemoteDevice(Device):
         super().__init__(tag.format(index))
         self.ip_addr = ip_addr
         self.port = port
+        self._loaded_marker = ""
         self._state_tag = re.sub(r"[^\w.-]", "_", f"{ip_addr}_{port}")
         self.client = GrpcChannel(self.ip_addr, self.port)
         self._stub = {
@@ -376,7 +358,7 @@ class RemoteDevice(Device):
     def get_bitfile_metadata(self, bitfile_name:str, partial:bool=False):
         if not partial:
             self.initial_global_state_file_boot_check()
-        parser = _get_bitstream_handler(bitfile_name, self._state_tag).get_parser(partial=partial)
+        parser = _get_bitstream_handler(bitfile_name, self._state_tag, self).get_parser(partial=partial)
         if parser is None:
             raise RuntimeError("Unable to find metadata for bitstream")
         return parser
@@ -441,61 +423,103 @@ class RemoteDevice(Device):
         """
         return RemoteMemory(self, description)
 
+    def _load_xclbin(self, data, firmware_data=b"", **kwargs):
+        def requests():
+            yield remote_device_pb2.XclbinRequest(**kwargs)
+            for offset in range(0, len(data), 2 * 1024 * 1024):
+                yield remote_device_pb2.XclbinRequest(data=data[offset:offset + 2 * 1024 * 1024])
+            for offset in range(0, len(firmware_data), 2 * 1024 * 1024):
+                yield remote_device_pb2.XclbinRequest(firmware_data=firmware_data[offset:offset + 2 * 1024 * 1024])
+        try:
+            return self._stub['device'].load_xclbin(requests())
+        except grpc.RpcError as error:
+            if error.code() == grpc.StatusCode.UNIMPLEMENTED:
+                raise RuntimeError("Update the PYNQ remote server for XCLBIN loading") from error
+            raise
+
+    def _generate_xclbin(self, parser, path, partial=False):
+        if partial:
+            self._validate_partial_memory(parser)
+            return self._active_xclbin_data
+        topology = _ip_to_topology({k: copy.deepcopy(v) for k, v in parser.mem_dict.items()
+                                    if 'phys_addr' in v and k != 'PSDDR'})
+        return self._load_xclbin(
+            DEFAULT_XCLBIN, prepare_only=True, overlay_name=Path(path).stem,
+            topology=json.dumps(topology),
+        ).data
+
+    def _validate_partial_memory(self, parser):
+        if not hasattr(self, '_active_xclbin_data'):
+            raise RuntimeError("Load the full overlay before a partial overlay")
+        memories = {(m.get('base_address', m.get('phys_addr')),
+                     m.get('size', m.get('addr_range'))) for m in self.mem_dict.values()}
+        for memory in parser.mem_dict.values():
+            if not memory.get('dfx') and (memory.get('base_address', memory.get('phys_addr')),
+                                         memory.get('size', memory.get('addr_range'))) not in memories:
+                raise RuntimeError("Partial overlays cannot change the memory topology")
+
+    def _clock_registers(self, parser):
+        if not any("enable" in clock for clock in parser.clock_dict.values()):
+            return []
+        pending = _RegisterUpdates(self)
+        clocks = self._clocks_class(device=pending)
+        for index, clock in parser.clock_dict.items():
+            if "enable" in clock:
+                if clock["enable"]:
+                    clocks.set_pl_clk(index, clk_mhz=clock["frequency"])
+                else:
+                    clocks.set_pl_clk(index)
+        return [remote_device_pb2.RegisterUpdate(address=address, mask=0xffffffff, value=value)
+                for address, value in pending.updates.items()]
+
     def download(self, bitstream, parser=None):
-        """Download bitstream to the remote FPGA device
-
-        This method handles the complete bitstream download process including:
-        - Transferring bitstream file to remote device  
-        - Configuring FPGA manager flags
-        - Setting AXI port widths
-        - Generating metadata cache
-
-        Parameters
-        ----------
-        bitstream : object
-            Bitstream object containing file and configuration information
-        parser : object, optional
-            Metadata parser object. If None, uses default XCLBIN parser.
-        """
+        """Program the selected board and register its XCLBIN metadata."""
         if parser is None:
             from .xclbin_parser import XclBin
             parser = XclBin(xclbin_data=DEFAULT_XCLBIN)
-            
+        if bitstream.partial:
+            self._validate_partial_memory(parser)
+        data = self._active_xclbin_data if bitstream.partial else parser.xclbin_data
+        # Probe support and validate metadata before uploading or programming firmware.
+        self._load_xclbin(data, prepare_only=True, overlay_name=Path(bitstream.bitfile_name).stem)
         if not bitstream.binfile_name:
             bitstream.binfile_name = Path(bitstream.bitfile_name).stem + ".bin"
-
         bin_data = getattr(parser, "bin_data", None)
         if bin_data is None:
             bin_data = _get_bitstream_handler(bitstream.bitfile_name).get_bin_data()
-        self.write_file(FIRMWARE + bitstream.binfile_name, bin_data)
-
-        if not bitstream.partial:
-            self.shutdown()
-            self.gen_cache(bitstream, parser)
-            flag = "0"
-        else:
-            flag = "1"
-
-        response = self._stub['device'].set_bitstream_attrs(
-            remote_device_pb2.SetBitstreamAttrsRequest(
-                binfile_name=bitstream.binfile_name,
-                partial=bitstream.partial,
+        if bin_data is None:
+            raise RuntimeError("The overlay has no supported programming image")
+        self.initial_global_state_file_boot_check()
+        expected = self._pl_marker() or ""
+        shutdown = []
+        if global_state_file_exists(self._state_tag):
+            state = load_global_state(self._state_tag)
+            expected = state.timestamp
+            shutdown = [ip.base_addr for ip in state.shutdown_ips.values()]
+        marker = uuid.uuid4().hex
+        registers = [] if bitstream.partial else self._clock_registers(parser)
+        registers.extend(remote_device_pb2.RegisterUpdate(address=a, mask=m, value=v)
+                         for a, m, v in self._axi_port_widths(parser))
+        try:
+            self._load_xclbin(
+                data, firmware_data=bin_data, overlay_name=Path(bitstream.bitfile_name).stem,
+                firmware=bitstream.binfile_name, partial=bitstream.partial,
+                expected_marker=expected, marker=marker,
+                shutdown_addresses=shutdown, registers=registers,
             )
-        )
-        if not response:
-            warnings.warn("Remote device failed to set bitstream attributes")
-
-        self.write_file(BS_FPGA_MAN_FLAGS, flag.encode())
-        self.write_file(BS_FPGA_MAN, bitstream.binfile_name.encode())
+        except BaseException:
+            clear_global_state(self._state_tag)
+            self.timestamp = None
+            raise
         if not bitstream.partial:
-            token = ""
-            if global_state_file_exists(self._state_tag):
-                token = load_global_state(self._state_tag).timestamp
-            self.write_file(PL_MARKER, token.encode())
-
-        self.set_axi_port_width(parser)
+            self._active_xclbin_data = data
+            self._loaded_marker = marker
+            self.gen_cache(bitstream, parser)
+            gs = load_global_state(self._state_tag)
+            gs.timestamp = marker
+            save_global_state(gs, self._state_tag)
         super().post_download(bitstream, parser, self.name)
-    
+
     def _boot_id(self):
         return self.read_file(BOOT_ID).decode("utf-8").strip()
 
@@ -573,11 +597,13 @@ class RemoteDevice(Device):
         response = self._stub['buffer'].allocate(
             buffer_pb2.AllocateRequest(size=size,
                                        dtype=dtype.str,
-                                       cacheable=bool(cacheable)
+                                       cacheable=bool(cacheable),
+                                       memory_group=kwargs.pop("memidx", 0),
+                                       overlay_marker=kwargs.pop("overlay_marker", self._loaded_marker),
                                        )
         )
-        if not response:
-            raise RuntimeError(response.msg)
+        if response.msg or not response.buffer_id:
+            raise RuntimeError(response.msg or "Remote allocation failed")
         buffer_id = response.buffer_id
         ar = RemoteBuffer(
             shape,
@@ -645,11 +671,7 @@ class RemoteDeviceTreeSegment(DeviceTreeSegment):
 
 
 class RemoteMemory:
-    """Remote Memory placeholder class
-
-    Placeholder implementation for the memories of an overlay on remote
-    devices. Allocating into a specific memory is not yet implemented for
-    remote PYNQ devices, so buffers are allocated in the default memory.
+    """Memory belonging to an overlay on a remote device.
 
     Parameters
     ----------
@@ -665,10 +687,10 @@ class RemoteMemory:
         self.idx = self.desc.get("idx")
         self.size = self.desc.get("size", self.desc.get("addr_range"))
         self.base_address = self.desc.get("base_address", self.desc.get("phys_addr"))
-        warnings.warn(
-            "Allocating into a specific memory is not yet implemented for "
-            "remote devices; using the default memory instead."
-        )
+        if desc is not None and self.idx is None:
+            raise RuntimeError("The selected memory has no XRT memory index")
+        if self.desc.get("streaming") or self.desc.get("used") is False:
+            raise RuntimeError("The selected memory does not support buffer allocation")
 
     def allocate(self, shape, dtype, **kwargs):
         """Create a new buffer in the memory
@@ -681,7 +703,12 @@ class RemoteMemory:
             Data type of the array
 
         """
-        return self.device.allocate(shape, dtype, **kwargs)
+        if self.desc:
+            current = next((m for m in self.device.mem_dict.values()
+                            if m.get("idx") == self.idx), None)
+            if current is None or (current.get("base_address"), current.get("size")) != (self.base_address, self.size):
+                raise RuntimeError("Memory changed; obtain it from the current overlay")
+        return self.device.allocate(shape, dtype, memidx=self.idx or 0, **kwargs)
 
 
 class RemoteGPIO:
@@ -1227,22 +1254,26 @@ class RemoteBuffer(np.ndarray):
         self.buffer_id = buffer_id
         self.coherent = False  # Always set to False for RemoteBuffer
         self.freed = False
+        self._owns_buffer = True
         self.device = device
         return self
 
     def __array_finalize__(self, obj):
+        self._owns_buffer = False
         if isinstance(obj, RemoteBuffer):
             self.coherent = obj.coherent
             self.stub = obj.stub
             self.buffer_id = obj.buffer_id
             self.device = obj.device
+            self.freed = obj.freed
         else:
             self.stub = None
             self.buffer_id = None
             self.coherent = None
+            self.freed = True
 
     def __del__(self):
-        if hasattr(self, 'freed') and not self.freed:
+        if getattr(self, '_owns_buffer', False) and not self.freed:
             try:
                 self.freebuffer()
             except Exception:
@@ -1307,6 +1338,8 @@ class RemoteBuffer(np.ndarray):
 
         flat_data = np.frombuffer(data_bytes, dtype=self.dtype)
         self[:] = flat_data.reshape(self.shape)
+
+    close = PynqBuffer.close
 
     def sync_to_device(self):
         """Copy the contents of the local buffer to the remote device."""

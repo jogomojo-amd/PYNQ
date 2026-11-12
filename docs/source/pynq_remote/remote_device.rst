@@ -29,9 +29,6 @@ When ``PYNQ_REMOTE_DEVICES`` is set, ``Device.devices`` lists one
 Local and remote devices share the architecture classes in
 :mod:`pynq.pl_server.arch`.
 
-Device tree overlays (``.dtbo``) shipped with a bitstream are applied on the
-board. This needs a remote image built with the matching ``pynq-remote``
-server; an older server reports that the remote image must be updated.
 
 The ``RemoteDevice`` class is complemented by ``PYNQ.cpp`` which operates on the target device, providing a C++ implementation of the PYNQ API. For more details on the C++ implementation, see the :ref:`cppindex` module documentation.
 

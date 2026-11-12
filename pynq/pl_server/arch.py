@@ -69,6 +69,29 @@ class ZynqUltrascaleArch:
     _clocks_class = ps._ClocksUltrascale
     _ps_core = UltrascaleProcSysCore
 
+    def _axi_port_widths(self, parser):
+        """Yield register addresses, masks and values for AXI port widths."""
+        if not hasattr(parser, "ps_name"):
+            # Setting port widths not supported for xclbin-only designs
+            return
+        parameter_dict = parser.ip_dict[parser.ps_name]["parameters"]
+        if parser.family_ps == "zynq_ultra_ps_e":
+            for para in ZU_FPD_SLCR_REG:
+                if para in parameter_dict:
+                    width = parameter_dict[para]
+                    for reg_name in ZU_FPD_SLCR_REG[para]:
+                        addr = ZU_FPD_SLCR_REG[para][reg_name]["addr"]
+                        f = ZU_FPD_SLCR_REG[para][reg_name]["field"]
+                        yield addr, ((1 << (f[0] - f[1] + 1)) - 1) << f[1], ZU_FPD_SLCR_VALUE[width] << f[1]
+            for para in ZU_AXIFM_REG:
+                if para in parameter_dict:
+                    width = parameter_dict[para]
+                    for reg_name in ZU_AXIFM_REG[para]:
+                        addr = ZU_AXIFM_REG[para][reg_name]["addr"]
+                        f = ZU_AXIFM_REG[para][reg_name]["field"]
+                        yield addr, ((1 << (f[0] - f[1] + 1)) - 1) << f[1], ZU_AXIFM_VALUE[width] << f[1]
+
+
     def set_axi_port_width(self, parser):
         """This method will set the AXI port width.
 
@@ -83,26 +106,9 @@ class ZynqUltrascaleArch:
 
         """
         from pynq.registers import Register
-
-        if not hasattr(parser, "ps_name"):
-            # Setting port widths not supported for xclbin-only designs
-            return
-        parameter_dict = parser.ip_dict[parser.ps_name]["parameters"]
-        if parser.family_ps == "zynq_ultra_ps_e":
-            for para in ZU_FPD_SLCR_REG:
-                if para in parameter_dict:
-                    width = parameter_dict[para]
-                    for reg_name in ZU_FPD_SLCR_REG[para]:
-                        addr = ZU_FPD_SLCR_REG[para][reg_name]["addr"]
-                        f = ZU_FPD_SLCR_REG[para][reg_name]["field"]
-                        Register(addr, device=self)[f[0] : f[1]] = ZU_FPD_SLCR_VALUE[width]
-            for para in ZU_AXIFM_REG:
-                if para in parameter_dict:
-                    width = parameter_dict[para]
-                    for reg_name in ZU_AXIFM_REG[para]:
-                        addr = ZU_AXIFM_REG[para][reg_name]["addr"]
-                        f = ZU_AXIFM_REG[para][reg_name]["field"]
-                        Register(addr, device=self)[f[0] : f[1]] = ZU_AXIFM_VALUE[width]
+        for address, mask, value in self._axi_port_widths(parser):
+            register = Register(address, device=self)
+            register[:] = (int(register) & ~mask) | value
 
 
 class VersalArch:

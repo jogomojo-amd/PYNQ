@@ -3,6 +3,7 @@ syntax = "proto3";
 package remote_device;
 
 service RemoteDevice {
+    rpc load_xclbin(stream XclbinRequest) returns (XclbinResponse) {}
     rpc set_bitstream_attrs(SetBitstreamAttrsRequest) returns (SetBitstreamAttrsResponse) {}
     rpc download (stream DownloadRequest) returns (DownloadResponse) {}
     rpc set_pl_clk(SetPlClkRequest) returns (SetPlClkResponse) {}
@@ -12,6 +13,31 @@ service RemoteDevice {
     rpc existsfile(ExistsFileRequest) returns (ExistsFileResponse) {}
     rpc makedir(MakeDirRequest) returns (MakeDirResponse) {}
     rpc removedir(RemoveDirRequest) returns (RemoveDirResponse) {}
+}
+
+message RegisterUpdate {
+    uint64 address = 1;
+    uint32 mask = 2;
+    uint32 value = 3;
+}
+
+message XclbinRequest {
+    bytes data = 1;
+    string overlay_name = 2;
+    string topology = 3;
+    bool prepare_only = 4;
+    string firmware = 5;
+    bool partial = 6;
+    string expected_marker = 7;
+    string marker = 8;
+    repeated uint64 shutdown_addresses = 9;
+    repeated RegisterUpdate registers = 10;
+    bytes firmware_data = 11;
+}
+
+message XclbinResponse {
+    bytes data = 1;
+    bool loaded = 2;
 }
 
 //Add ReadFileRequest/Response

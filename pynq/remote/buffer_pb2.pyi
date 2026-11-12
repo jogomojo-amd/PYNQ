@@ -57,14 +57,18 @@ class FlushResponse(_message.Message):
     def __init__(self, msg: _Optional[str] = ...) -> None: ...
 
 class AllocateRequest(_message.Message):
-    __slots__ = ("size", "dtype", "cacheable")
+    __slots__ = ("size", "dtype", "cacheable", "memory_group", "overlay_marker")
     SIZE_FIELD_NUMBER: _ClassVar[int]
     DTYPE_FIELD_NUMBER: _ClassVar[int]
     CACHEABLE_FIELD_NUMBER: _ClassVar[int]
+    MEMORY_GROUP_FIELD_NUMBER: _ClassVar[int]
+    OVERLAY_MARKER_FIELD_NUMBER: _ClassVar[int]
     size: int
     dtype: str
     cacheable: bool
-    def __init__(self, size: _Optional[int] = ..., dtype: _Optional[str] = ..., cacheable: bool = ...) -> None: ...
+    memory_group: int
+    overlay_marker: str
+    def __init__(self, size: _Optional[int] = ..., dtype: _Optional[str] = ..., cacheable: bool = ..., memory_group: _Optional[int] = ..., overlay_marker: _Optional[str] = ...) -> None: ...
 
 class AllocateResponse(_message.Message):
     __slots__ = ("msg", "buffer_id")

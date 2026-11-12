@@ -48,7 +48,7 @@ public:
  * @param cacheable Indicates if the buffer should have the cacheable flag enabled.
  * @return The handle to the allocated buffer.
  */
-    xrt::bo allocate_bo(size_t size, bool cacheable);
+    xrt::bo allocate_bo(size_t size, bool cacheable, uint32_t memory_group = 0);
 /**
  * @brief Frees a previously allocated buffer object (BO).
  * 
@@ -138,7 +138,7 @@ public:
      * @param xrt_manager A reference to the XrtBufferManager for buffer management.
      * @param cacheable A boolean indicating if the buffer is cacheable.
      */
-    BufferRemote(const size_t size, const std::string &dtype, XrtBufferManager &xrt_manager, bool cacheable);
+    BufferRemote(const size_t size, const std::string &dtype, XrtBufferManager &xrt_manager, bool cacheable, uint32_t memory_group = 0);
 
 
     /**

@@ -1,4 +1,5 @@
 #   Copyright (c) 2019-2022, Xilinx, Inc.
+#   Copyright (C) 2022-2026 Advanced Micro Devices, Inc.
 #   SPDX-License-Identifier: BSD-3-Clause
 
 import asyncio
@@ -10,6 +11,8 @@ import os
 import subprocess
 import warnings
 import weakref
+import tempfile
+from pathlib import Path
 
 import numpy as np
 from collections import namedtuple
@@ -410,15 +413,21 @@ class XrtDevice(Device):
                 return self.get_memory(m)
         raise RuntimeError("Could not find memory")
 
-    def _xrt_download(self, data):
-        # Load the xclbin from the in-memory buffer
-        with open("loaded.xclbin", "wb") as f:  # Open file in binary write mode
-            f.write(data)
+    def _xrt_download(self, data, name="overlay"):
+        boot_id = Path("/proc/sys/kernel/random/boot_id")
+        tag = boot_id.read_text().strip() if boot_id.exists() else "local"
+        candidate = tempfile.TemporaryDirectory(prefix=f"pynq-{tag}-xrt{self._index}-")
         try:
-            uuid = self.handle.load_xclbin("loaded.xclbin")
-        except Exception as e:
-            print(f"Error loading xclbin: {e}")
+            path = Path(candidate.name) / (Path(name).stem + ".xclbin")
+            path.write_bytes(data)
+            self.handle.load_xclbin(str(path))
+        except BaseException:
+            candidate.cleanup()
             raise
+        previous = getattr(self, "_xclbin_directory", None)
+        self._xclbin_directory = candidate
+        if previous is not None:
+            previous.cleanup()
 
     def gen_cache(self, bitstream, parser=None):
         pass
@@ -426,7 +435,7 @@ class XrtDevice(Device):
     def download(self, bitstream, parser=None):
         with open(bitstream.bitfile_name, "rb") as f:
             data = f.read()
-        self._xrt_download(data)
+        self._xrt_download(data, bitstream.bitfile_name)
         super().post_download(bitstream, parser)
 
     def set_event_loop(self, loop):

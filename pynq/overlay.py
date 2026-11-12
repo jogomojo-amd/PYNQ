@@ -416,12 +416,13 @@ class Overlay(Bitstream):
 
         """
         Clocks.set_device(self.device)
-        for i in self.clock_dict:
-            if "enable" in self.clock_dict[i]:
-                if self.clock_dict[i]["enable"]:
-                    Clocks.set_pl_clk(i, clk_mhz=self.clock_dict[i]["frequency"])
-                else:
-                    Clocks.set_pl_clk(i)
+        if not self.device.has_capability("REMOTE"):
+            for i in self.clock_dict:
+                if "enable" in self.clock_dict[i]:
+                    if self.clock_dict[i]["enable"]:
+                        Clocks.set_pl_clk(i, clk_mhz=self.clock_dict[i]["frequency"])
+                    else:
+                        Clocks.set_pl_clk(i)
 
         super().download(self.parser)
         if dtbo:

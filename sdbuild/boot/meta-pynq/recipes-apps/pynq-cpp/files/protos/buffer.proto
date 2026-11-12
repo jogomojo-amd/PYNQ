@@ -51,6 +51,8 @@ message AllocateRequest {
     int32 size = 1;
     string dtype = 2;
     bool cacheable = 3;
+    optional uint32 memory_group = 4;
+    string overlay_marker = 5;
 }
 
 message AllocateResponse {

@@ -3,7 +3,7 @@
 import grpc
 import warnings
 
-from pynq.remote import remote_device_pb2 as remote__device__pb2
+from . import remote_device_pb2 as remote__device__pb2
 
 GRPC_GENERATED_VERSION = '1.64.0'
 GRPC_VERSION = grpc.__version__
@@ -39,6 +39,11 @@ class RemoteDeviceStub(object):
         Args:
             channel: A grpc.Channel.
         """
+        self.load_xclbin = channel.stream_unary(
+                '/remote_device.RemoteDevice/load_xclbin',
+                request_serializer=remote__device__pb2.XclbinRequest.SerializeToString,
+                response_deserializer=remote__device__pb2.XclbinResponse.FromString,
+                _registered_method=True)
         self.set_bitstream_attrs = channel.unary_unary(
                 '/remote_device.RemoteDevice/set_bitstream_attrs',
                 request_serializer=remote__device__pb2.SetBitstreamAttrsRequest.SerializeToString,
@@ -88,6 +93,12 @@ class RemoteDeviceStub(object):
 
 class RemoteDeviceServicer(object):
     """Missing associated documentation comment in .proto file."""
+
+    def load_xclbin(self, request_iterator, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
 
     def set_bitstream_attrs(self, request, context):
         """Missing associated documentation comment in .proto file."""
@@ -146,6 +157,11 @@ class RemoteDeviceServicer(object):
 
 def add_RemoteDeviceServicer_to_server(servicer, server):
     rpc_method_handlers = {
+            'load_xclbin': grpc.stream_unary_rpc_method_handler(
+                    servicer.load_xclbin,
+                    request_deserializer=remote__device__pb2.XclbinRequest.FromString,
+                    response_serializer=remote__device__pb2.XclbinResponse.SerializeToString,
+            ),
             'set_bitstream_attrs': grpc.unary_unary_rpc_method_handler(
                     servicer.set_bitstream_attrs,
                     request_deserializer=remote__device__pb2.SetBitstreamAttrsRequest.FromString,
@@ -201,6 +217,33 @@ def add_RemoteDeviceServicer_to_server(servicer, server):
  # This class is part of an EXPERIMENTAL API.
 class RemoteDevice(object):
     """Missing associated documentation comment in .proto file."""
+
+    @staticmethod
+    def load_xclbin(request_iterator,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.stream_unary(
+            request_iterator,
+            target,
+            '/remote_device.RemoteDevice/load_xclbin',
+            remote__device__pb2.XclbinRequest.SerializeToString,
+            remote__device__pb2.XclbinResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
 
     @staticmethod
     def set_bitstream_attrs(request,

@@ -21,6 +21,12 @@
 #include <sstream>
 #include <filesystem>
 #include <cerrno>
+#include <mutex>
+#include <map>
+#include <sys/wait.h>
+#include <experimental/xrt_xclbin.h>
+#include <csignal>
+#include <thread>
 
 
 #include <remote_device.grpc.pb.h>
@@ -138,27 +144,243 @@ using xrfdc::GetDACCompModeResponse;
 
 #define DEBUG
 
+
+static std::string read_text(const std::filesystem::path &path)
+{
+    std::ifstream input(path, std::ios::binary);
+    return {std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>()};
+}
+
+static void write_text(const std::filesystem::path &path, const std::string &data)
+{
+    std::ofstream output(path, std::ios::binary);
+    output.write(data.data(), data.size());
+    output.close();
+    if (!output)
+        throw std::runtime_error("Cannot write " + path.string());
+}
+
+struct TemporaryXclbin
+{
+    std::filesystem::path directory;
+    std::filesystem::path path;
+    std::filesystem::path firmware;
+
+    explicit TemporaryXclbin(const std::string &overlay)
+    {
+        auto pattern = (std::filesystem::temp_directory_path() /
+            ("pynq-" + read_text("/proc/sys/kernel/random/boot_id").substr(0, 36) + "-XXXXXX")).string();
+        if (!mkdtemp(pattern.data()))
+            throw std::runtime_error("Cannot create XCLBIN temporary directory");
+        directory = pattern;
+        path = directory / (std::filesystem::path(overlay).filename().string() + ".xclbin");
+    }
+
+    ~TemporaryXclbin()
+    {
+        std::error_code error;
+        if (!firmware.empty()) {
+            std::filesystem::remove(firmware, error);
+            if (error)
+                std::cerr << "Cannot remove staged firmware: " << error.message() << std::endl;
+        }
+        std::filesystem::remove_all(directory, error);
+        if (error)
+            std::cerr << "Cannot remove XCLBIN directory: " << error.message() << std::endl;
+    }
+
+    void generate(const std::string &topology)
+    {
+        write_text(directory / "mem.json", topology);
+        auto input = path.string();
+        auto output = (directory / "generated").string();
+        auto section = "MEM_TOPOLOGY:JSON:" + (directory / "mem.json").string();
+        auto pid = fork();
+        if (pid < 0)
+            throw std::runtime_error("Cannot start xclbinutil");
+        if (pid == 0) {
+            execlp("xclbinutil", "xclbinutil", "--input", input.c_str(),
+                   "--remove-section", "GROUP_TOPOLOGY",
+                   "--replace-section", section.c_str(), "--output", output.c_str(),
+                   "--skip-bank-grouping", nullptr);
+            _exit(127);
+        }
+        int status;
+        while (waitpid(pid, &status, 0) < 0) {
+            if (errno != EINTR)
+                throw std::runtime_error("Cannot wait for xclbinutil");
+        }
+        if (!WIFEXITED(status) || WEXITSTATUS(status))
+            throw std::runtime_error("xclbinutil failed to generate memory metadata");
+        std::filesystem::rename(output, path);
+        std::filesystem::remove(directory / "mem.json");
+    }
+
+    void validate() const
+    {
+        auto size = std::filesystem::file_size(path);
+        axlf header{};
+        const auto start = offsetof(axlf, m_sections);
+        std::ifstream input(path, std::ios::binary);
+        input.read(reinterpret_cast<char *>(&header), start);
+        if (!input || std::memcmp(header.m_magic, "xclbin2", sizeof(header.m_magic)) ||
+            header.m_header.m_length != size || size < start ||
+            header.m_header.m_numSections > (size - start) / sizeof(axlf_section_header))
+            throw std::runtime_error("Invalid or truncated XCLBIN header");
+        const auto sections_end = start + header.m_header.m_numSections * sizeof(axlf_section_header);
+        for (uint32_t i = 0; i < header.m_header.m_numSections; ++i) {
+            axlf_section_header section{};
+            input.read(reinterpret_cast<char *>(&section), sizeof(section));
+            if (!input || section.m_sectionOffset < sections_end ||
+                section.m_sectionOffset > size || section.m_sectionSize > size - section.m_sectionOffset)
+                throw std::runtime_error("Invalid or truncated XCLBIN section");
+            if (section.m_sectionKind == MEM_TOPOLOGY || section.m_sectionKind == ASK_GROUP_TOPOLOGY) {
+                const auto entries = offsetof(mem_topology, m_mem_data);
+                int32_t count = -1;
+                std::ifstream topology(path, std::ios::binary);
+                topology.seekg(section.m_sectionOffset);
+                topology.read(reinterpret_cast<char *>(&count), sizeof(count));
+                if (!topology || count < 0 || section.m_sectionSize < entries ||
+                    static_cast<uint64_t>(count) > (section.m_sectionSize - entries) / sizeof(mem_data))
+                    throw std::runtime_error("Invalid or truncated XCLBIN memory topology");
+            }
+        }
+    }
+};
+
 class BufferImpl final : public RemoteBuffer::Service
 {
 private:
     xrt::device device;
     XrtBufferManager manager;
+    std::mutex mutex_;
+    std::unique_ptr<TemporaryXclbin> active_xclbin_;
+    std::map<uint32_t, std::pair<uint64_t, uint64_t>> memory_groups_;
+    bool valid_ = true;
+    std::string active_marker_;
+    uint64_t next_buffer_ = 0;
+    const std::string session_ = read_text("/proc/sys/kernel/random/uuid");
     std::unordered_map<std::string, std::unique_ptr<BufferRemote>> buffers_;
 
-    std::string generate_unique_id(const std::unique_ptr<BufferRemote> &buffer)
+    bool ready()
     {
-        std::ostringstream oss;
-        oss << buffer.get();
-        return oss.str();
+        valid_ = valid_ && (!active_xclbin_ || read_text("/tmp/pynq_pl_state") == active_marker_);
+        return valid_;
     }
 
 public:
+
+    Status load_xclbin(ServerContext *context,
+                       ServerReader<remote_device::XclbinRequest> *reader,
+                       remote_device::XclbinResponse *response, bool &invalidated)
+    {
+        remote_device::XclbinRequest header, chunk;
+        if (!reader->Read(&header) || header.overlay_name().empty())
+            return Status(grpc::StatusCode::INVALID_ARGUMENT, "Missing overlay name");
+        try {
+            auto candidate = std::make_unique<TemporaryXclbin>(header.overlay_name());
+            std::ofstream output(candidate->path, std::ios::binary);
+            std::ofstream firmware(candidate->directory / "firmware", std::ios::binary);
+            while (reader->Read(&chunk)) {
+                output.write(chunk.data().data(), chunk.data().size());
+                firmware.write(chunk.firmware_data().data(), chunk.firmware_data().size());
+                if (!output || !firmware)
+                    throw std::runtime_error("Cannot write XCLBIN upload");
+            }
+            output.close();
+            firmware.close();
+            if (!output || !firmware)
+                throw std::runtime_error("Cannot close XCLBIN upload");
+            if (context->IsCancelled())
+                return Status(grpc::StatusCode::CANCELLED, "XCLBIN upload cancelled");
+            if (!header.topology().empty())
+                candidate->generate(header.topology());
+            candidate->validate();
+            xrt::xclbin binary(candidate->path.string());
+            std::map<uint32_t, std::pair<uint64_t, uint64_t>> groups;
+            for (const auto &memory : binary.get_mems()) {
+                if (memory.get_used())
+                    groups.emplace(memory.get_index(), std::make_pair(
+                        memory.get_base_address(), memory.get_size_kb() * 1024));
+            }
+            if (header.prepare_only()) {
+                if (!header.topology().empty())
+                    response->set_data(read_text(candidate->path));
+                return Status::OK;
+            }
+            if (std::filesystem::path(header.firmware()).filename() != header.firmware() ||
+                header.firmware().empty() || header.marker().empty())
+                return Status(grpc::StatusCode::INVALID_ARGUMENT, "Invalid overlay firmware or marker");
+            if (!std::filesystem::file_size(candidate->directory / "firmware"))
+                return Status(grpc::StatusCode::INVALID_ARGUMENT, "Missing programming image");
+            candidate->firmware = std::filesystem::path("/lib/firmware") /
+                (candidate->directory.filename().string() + "-" + header.firmware());
+            std::filesystem::copy_file(candidate->directory / "firmware", candidate->firmware);
+            std::filesystem::remove(candidate->directory / "firmware");
+            std::lock_guard<std::mutex> lock(mutex_);
+            const std::filesystem::path marker("/tmp/pynq_pl_state");
+            if (read_text(marker) != header.expected_marker())
+                return Status(grpc::StatusCode::FAILED_PRECONDITION, "Another client changed the overlay; reload its metadata");
+            if (header.partial() && (!ready() || !active_xclbin_ || groups != memory_groups_))
+                return Status(grpc::StatusCode::FAILED_PRECONDITION, "Partial overlays cannot change memory topology");
+            if (header.partial() && !buffers_.empty() && header.shutdown_addresses().empty())
+                return Status(grpc::StatusCode::FAILED_PRECONDITION, "Cannot establish buffer shutdown for partial reconfiguration");
+            if (context->IsCancelled())
+                return Status(grpc::StatusCode::CANCELLED, "Overlay loading cancelled");
+            valid_ = false;
+            invalidated = true;
+            write_text(marker, "invalid");
+            for (auto address : header.shutdown_addresses()) {
+                MMIO control(address, sizeof(uint32_t));
+                if (!control.is_mapped())
+                    return Status(grpc::StatusCode::FAILED_PRECONDITION, "Cannot map overlay shutdown manager");
+                control.write(1, 0);
+                unsigned attempts = 0;
+                while (control.read(0) != 0x0f && ++attempts < 16000) {}
+                if (attempts == 16000)
+                    return Status(grpc::StatusCode::FAILED_PRECONDITION, "Overlay shutdown timed out");
+            }
+            if (context->IsCancelled())
+                return Status(grpc::StatusCode::CANCELLED, "Overlay loading cancelled");
+            write_text("/sys/class/fpga_manager/fpga0/flags", header.partial() ? "1" : "0");
+            write_text("/sys/class/fpga_manager/fpga0/firmware", candidate->firmware.filename().string());
+            std::filesystem::remove(candidate->firmware);
+            // Keep storage alive until the old PL can no longer access it.
+            buffers_.clear();
+            for (const auto &update : header.registers()) {
+                MMIO reg(update.address(), sizeof(uint32_t));
+                if (!reg.is_mapped())
+                    throw std::runtime_error("Cannot map AXI port configuration");
+                reg.write((reg.read(0) & ~update.mask()) | (update.value() & update.mask()), 0);
+                if ((reg.read(0) & update.mask()) != (update.value() & update.mask()))
+                    throw std::runtime_error("AXI port configuration readback failed");
+            }
+            if (!header.partial())
+                device.load_xclbin(binary);
+            if (context->IsCancelled())
+                return Status(grpc::StatusCode::CANCELLED, "Overlay loading cancelled");
+            if (!header.partial()) {
+                active_xclbin_ = std::move(candidate);
+                memory_groups_ = std::move(groups);
+                active_marker_ = header.marker();
+            }
+            write_text(marker, header.partial() ? header.expected_marker() : header.marker());
+            valid_ = true;
+            response->set_loaded(true);
+            return Status::OK;
+        } catch (const std::exception &error) {
+            return Status(grpc::StatusCode::INTERNAL, error.what());
+        }
+    }
+
     std::string device_name = "";
     // Constructor with member initialization list
     BufferImpl()
         : device(open_device("0")), // Initialize device using open_device method
           manager(device)           // Initialize manager with the created device
     {
+        if (session_.empty())
+            throw std::runtime_error("Cannot obtain a unique buffer session identifier");
         device_name = device.get_info<xrt::info::device::name>();
         std::cout << "device name: " << device_name << "\n";
     }
@@ -192,6 +414,7 @@ private:
      */
     Status allocate(ServerContext *context, const AllocateRequest *request, AllocateResponse *response) override
     {
+        std::lock_guard<std::mutex> lock(mutex_);
         #ifdef DEBUG
         std::cout << "Allocate Request Received: "
                   << "size=" << static_cast<size_t>(request->size()) << ", "
@@ -201,14 +424,32 @@ private:
         #endif
         try
         {
-            auto buffer = std::make_unique<BufferRemote>(static_cast<size_t>(request->size()), request->dtype(), manager, request->cacheable());
-            std::string buffer_id = generate_unique_id(buffer);
+            if (request->size() <= 0)
+                return Status(grpc::StatusCode::INVALID_ARGUMENT, "Buffer size must be positive");
+            if (!ready())
+                return Status(grpc::StatusCode::FAILED_PRECONDITION, "Load an overlay before allocating buffers");
+            if (!request->overlay_marker().empty() &&
+                request->overlay_marker() != read_text("/tmp/pynq_pl_state"))
+                return Status(grpc::StatusCode::FAILED_PRECONDITION, "Overlay changed; reload before allocating buffers");
+            auto group = request->has_memory_group() ? request->memory_group() : 0;
+            if ((active_xclbin_ && !memory_groups_.count(group)) || (!active_xclbin_ && group != 0))
+                return Status(grpc::StatusCode::INVALID_ARGUMENT, "Memory group is not available in this overlay");
+            auto buffer = std::make_unique<BufferRemote>(static_cast<size_t>(request->size()), request->dtype(), manager, request->cacheable(), group);
+            if (active_xclbin_ && (group != 0 || memory_groups_.at(group).first != 0)) {
+                const auto &region = memory_groups_.at(group);
+                auto address = buffer->physical_address();
+                if (address < region.first || address - region.first > region.second ||
+                    static_cast<size_t>(request->size()) > region.second - (address - region.first))
+                    return Status(grpc::StatusCode::FAILED_PRECONDITION,
+                        "XRT allocated outside the selected memory; check this image's memory reservations");
+            }
+            std::string buffer_id = session_ + ":" + std::to_string(++next_buffer_);
             buffers_[buffer_id] = std::move(buffer);
             response->set_buffer_id(buffer_id);
         }
         catch (const std::exception &e)
         {
-            std::cerr << "Allocation failed: " << e.what() << std::endl;
+            return Status(grpc::StatusCode::INTERNAL, e.what());
         }
         return grpc::Status::OK;
     }
@@ -234,6 +475,7 @@ private:
      */
     Status write(ServerContext *context, ServerReader<BufferWriteRequest> *reader, BufferWriteResponse *response) override
     {
+        std::lock_guard<std::mutex> lock(mutex_);
         #ifdef DEBUG
         std::cout << "Write Request Received" << std::endl;
         #endif
@@ -250,11 +492,13 @@ private:
                 // std::cout << "In start" << std::endl;
                 start = false;
                 // Use the buffer id to get the buffer this stream request associates with once.
+                if (!ready())
+                    return Status(grpc::StatusCode::FAILED_PRECONDITION, "Overlay invalidated; load an overlay first");
                 auto it = buffers_.find(request.buffer_id());
                 if (it == buffers_.end())
                 {
                     std::cerr << "Buffer not found: " << request.buffer_id() << std::endl;
-                    response->set_msg("Buffer not found.");
+                    response->set_msg("Buffer invalidated or freed; allocate a new buffer");
                     return Status::OK;
                 }
 
@@ -303,15 +547,18 @@ private:
      */
     Status read(ServerContext *context, const BufferReadRequest *request, ServerWriter<BufferReadResponse> *writer) override
     {
+        std::lock_guard<std::mutex> lock(mutex_);
 #ifdef DEBUG
         std::cout << "Read Request Received: " << std::endl;
 #endif
 
+        if (!ready())
+            return Status(grpc::StatusCode::FAILED_PRECONDITION, "Overlay invalidated; load an overlay first");
         auto it = buffers_.find(request->buffer_id());
         if (it == buffers_.end())
         {
             std::cerr << "Buffer not found: " << request->buffer_id() << std::endl;
-            return grpc::Status(grpc::StatusCode::NOT_FOUND, "Buffer not found.");
+            return grpc::Status(grpc::StatusCode::NOT_FOUND, "Buffer invalidated or freed; allocate a new buffer");
         }
 
         auto buffer = it->second.get();
@@ -368,31 +615,12 @@ private:
      * @param response The response indicating the status of the operation.
      * @return grpc::Status The status of the operation.
      */
-    Status  freebuffer(ServerContext *context, const FreeBufferRequest *request, FreeBufferResponse *response) override
+    Status freebuffer(ServerContext *context, const FreeBufferRequest *request, FreeBufferResponse *response) override
     {
-#ifdef DEBUG
-        std::cout << "Freebuffer Request Received: " << request->buffer_id() << std::endl;
-#endif
-        // Find the buffer based on the buffer_id in the request
-        auto it = buffers_.find(request->buffer_id());
-        if (it == buffers_.end())
-        {
-            std::cerr << "Buffer not found: " << request->buffer_id() << std::endl;
-            return grpc::Status(grpc::StatusCode::NOT_FOUND, "Buffer not found.");
-        }
-        else
-        {
-
-            buffers_.erase(it); // Remove from map and auto call destructor for object as it is a unique_ptr type
-#ifdef DEBUG
-            it = buffers_.find(request->buffer_id()); // Check that buffer is free'd successfully by searching for it.
-            if (it == buffers_.end())
-            {
-                std::cout << "Buffer Successfuly Freed: " << request->buffer_id() << std::endl;
-            }
-#endif
-        }
-        return grpc::Status::OK;
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (ready())
+            buffers_.erase(request->buffer_id());
+        return Status::OK;
     }
 
     /**
@@ -411,15 +639,18 @@ private:
      */
     Status flush(ServerContext *context, const FlushRequest *request, FlushResponse *response) override
     {
+        std::lock_guard<std::mutex> lock(mutex_);
 #ifdef DEBUG
         std::cout << "Flush Request Received: " << request->buffer_id() << std::endl;
 #endif
         // Find the buffer based on the buffer_id in the request
+        if (!ready())
+            return Status(grpc::StatusCode::FAILED_PRECONDITION, "Overlay invalidated; load an overlay first");
         auto it = buffers_.find(request->buffer_id());
         if (it == buffers_.end())
         {
             std::cerr << "Buffer not found: " << request->buffer_id() << std::endl;
-            return grpc::Status(grpc::StatusCode::NOT_FOUND, "Buffer not found.");
+            return grpc::Status(grpc::StatusCode::NOT_FOUND, "Buffer invalidated or freed; allocate a new buffer");
         }
         auto buffer = it->second.get();
         buffer->flush();
@@ -440,15 +671,18 @@ private:
      */
     Status invalidate(ServerContext *context, const InvalidateRequest *request, InvalidateResponse *response) override
     {
+        std::lock_guard<std::mutex> lock(mutex_);
 #ifdef DEBUG
         std::cout << "Invalidate Request Received: " << request->buffer_id() << std::endl;
 #endif
         // Find the buffer based on the buffer_id in the request
+        if (!ready())
+            return Status(grpc::StatusCode::FAILED_PRECONDITION, "Overlay invalidated; load an overlay first");
         auto it = buffers_.find(request->buffer_id());
         if (it == buffers_.end())
         {
             std::cerr << "Buffer not found: " << request->buffer_id() << std::endl;
-            return grpc::Status(grpc::StatusCode::NOT_FOUND, "Buffer not found.");
+            return grpc::Status(grpc::StatusCode::NOT_FOUND, "Buffer invalidated or freed; allocate a new buffer");
         }
         auto buffer = it->second.get();
         buffer->invalidate();
@@ -470,15 +704,18 @@ private:
      */
     Status physical_address(ServerContext *context, const AddressRequest *request, AddressResponse *response) override
     {
+        std::lock_guard<std::mutex> lock(mutex_);
 #ifdef DEBUG
         std::cout << "Physical_address Request Received: " << request->buffer_id() << std::endl;
 #endif
         // Find the buffer based on the buffer_id in the request
+        if (!ready())
+            return Status(grpc::StatusCode::FAILED_PRECONDITION, "Overlay invalidated; load an overlay first");
         auto it = buffers_.find(request->buffer_id());
         if (it == buffers_.end())
         {
             std::cerr << "Buffer not found: " << request->buffer_id() << std::endl;
-            return grpc::Status(grpc::StatusCode::NOT_FOUND, "Buffer not found.");
+            return grpc::Status(grpc::StatusCode::NOT_FOUND, "Buffer invalidated or freed; allocate a new buffer");
         }
         auto buffer = it->second.get();
         uint64_t paddr = buffer->physical_address();
@@ -504,15 +741,18 @@ private:
      */
     Status virtual_address(ServerContext *context, const AddressRequest *request, AddressResponse *response) override
     {
+        std::lock_guard<std::mutex> lock(mutex_);
 #ifdef DEBUG
         std::cout << "Virtual_address Request Received: " << request->buffer_id() << std::endl;
 #endif
         // Find the buffer based on the buffer_id in the request
+        if (!ready())
+            return Status(grpc::StatusCode::FAILED_PRECONDITION, "Overlay invalidated; load an overlay first");
         auto it = buffers_.find(request->buffer_id());
         if (it == buffers_.end())
         {
             std::cerr << "Buffer not found: " << request->buffer_id() << std::endl;
-            return grpc::Status(grpc::StatusCode::NOT_FOUND, "Buffer not found.");
+            return grpc::Status(grpc::StatusCode::NOT_FOUND, "Buffer invalidated or freed; allocate a new buffer");
         }
         auto buffer = it->second.get();
         uint64_t vaddr = buffer->virtual_address();
@@ -538,15 +778,18 @@ private:
      */
     Status cacheable(ServerContext *context, const CacheableRequest *request, CacheableResponse *response) override
     {
+        std::lock_guard<std::mutex> lock(mutex_);
 #ifdef DEBUG
         std::cout << "Cacheable Request Received: " << std::endl;
 #endif
         // Find the buffer based on the buffer_id in the request
+        if (!ready())
+            return Status(grpc::StatusCode::FAILED_PRECONDITION, "Overlay invalidated; load an overlay first");
         auto it = buffers_.find(request->buffer_id());
         if (it == buffers_.end())
         {
             std::cerr << "Buffer not found: " << request->buffer_id() << std::endl;
-            return grpc::Status(grpc::StatusCode::NOT_FOUND, "Buffer not found.");
+            return grpc::Status(grpc::StatusCode::NOT_FOUND, "Buffer invalidated or freed; allocate a new buffer");
         }
         auto buffer = it->second.get();
         bool cacheable = buffer->cacheable();
@@ -900,6 +1143,7 @@ class RemoteDeviceImpl final : public RemoteDevice::Service
 private:
     const std::string FIRMWARE = "/lib/firmware/";                               ///< Directory for bitstream files
     Device remote_device_;
+    BufferImpl *buffers_ = nullptr;
 #ifdef RFSOC
     XrfdcImpl* xrfdc_service_ = nullptr;   ///< Notified on bitstream download so it can drop its stale RFDC mapping.
     XrfclkImpl* xrfclk_service_ = nullptr; ///< Notified on bitstream download so it can drop its cached clock-device state.
@@ -941,6 +1185,23 @@ public:
      * @param response SetBitstreamAttrsResponse message. Contains bool status
      * @return gRPC status.
      */
+    void set_buffer_service(BufferImpl *buffers) { buffers_ = buffers; }
+
+    Status load_xclbin(ServerContext *context,
+                       ServerReader<remote_device::XclbinRequest> *reader,
+                       remote_device::XclbinResponse *response) override
+    {
+        bool invalidated = false;
+        auto status = buffers_->load_xclbin(context, reader, response, invalidated);
+#ifdef RFSOC
+        if (invalidated) {
+            if (xrfdc_service_) xrfdc_service_->invalidate();
+            if (xrfclk_service_) xrfclk_service_->invalidate();
+        }
+#endif
+        return status;
+    }
+
     Status set_bitstream_attrs(ServerContext *context, const SetBitstreamAttrsRequest *request, SetBitstreamAttrsResponse *response) override
     {
         remote_device_.set_bitstream_attrs(request->binfile_name(), request->partial());
@@ -1144,7 +1405,7 @@ public:
  * Sets up and starts the gRPC server on the specified port.
  * @param port Port number for the server.
  */
-void RunServer(uint16_t port)
+void RunServer(uint16_t port, const sigset_t &signals)
 {
     // Server runs locally on port assigned via absl::flag.
     std::string server_address = "0.0.0.0:" + std::to_string(port);
@@ -1158,6 +1419,7 @@ void RunServer(uint16_t port)
     remote_device_service.set_rfsoc_services(&xrfdc_service, &xrfclk_service);
 #endif
     remote_device_service.device_name = buffer_service.device_name;
+    remote_device_service.set_buffer_service(&buffer_service);
 
     grpc::EnableDefaultHealthCheckService(true);
     grpc::reflection::InitProtoReflectionServerBuilderPlugin();
@@ -1173,14 +1435,27 @@ void RunServer(uint16_t port)
 #endif
 
     std::unique_ptr<Server> server(builder.BuildAndStart());
+    if (!server)
+        throw std::runtime_error("Cannot start PYNQ remote server");
+    std::thread shutdown([&] {
+        int signal;
+        sigwait(&signals, &signal);
+        server->Shutdown();
+    });
     std::cout << "Server listening on " << server_address << std::endl;
     // Wait for the server to shutdown. Note that some other thread must be
     // responsible for shutting down the server for this call to ever return.
     server->Wait();
+    shutdown.join();
 }
 
 int main(int argc, char **argv)
 {
-    RunServer(7967);
+    sigset_t signals;
+    sigemptyset(&signals);
+    sigaddset(&signals, SIGTERM);
+    sigaddset(&signals, SIGINT);
+    pthread_sigmask(SIG_BLOCK, &signals, nullptr);
+    RunServer(7967, signals);
     return 0;
 }

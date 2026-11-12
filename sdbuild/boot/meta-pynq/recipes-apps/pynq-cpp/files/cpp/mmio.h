@@ -35,6 +35,7 @@ public:
      * Cleans up memory mapping and file descriptor.
      */
     ~MMIO();
+    bool is_mapped() const { return mapped_base != nullptr; }
 
     /**
      * @brief Reads a 32-bit value from the mapped memory.

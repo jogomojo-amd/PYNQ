@@ -71,6 +71,7 @@ $(DIST_ROOT):
 
 PYNQ_UPDATE := $(BUILD_ROOT)/PYNQ/.git/HEAD
 PYNQ_MASTER_COMMIT := $(shell git rev-parse HEAD)
+PYNQ_WORKTREE_DIRTY := $(shell git diff --quiet HEAD || echo dirty)
 PYNQ_CLONED_COMMIT := $(shell cd $(BUILD_ROOT)/PYNQ 2> /dev/null && git rev-parse HEAD)
 
 $(BUILD_ROOT)/PYNQ: | $(BUILD_ROOT)
@@ -80,7 +81,7 @@ $(BUILD_ROOT)/PYNQ: | $(BUILD_ROOT)
 $(PYNQ_UPDATE): | $(BUILD_ROOT)/PYNQ
 	cd $(BUILD_ROOT)/PYNQ && git fetch origin && git checkout $(PYNQ_MASTER_COMMIT)
 
-ifneq "$(PYNQ_MASTER_COMMIT)" "$(PYNQ_CLONED_COMMIT)"
+ifneq "$(PYNQ_MASTER_COMMIT)$(PYNQ_WORKTREE_DIRTY)" "$(PYNQ_CLONED_COMMIT)"
 .PHONY: $(PYNQ_UPDATE)
 endif
 

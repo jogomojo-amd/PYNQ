@@ -466,6 +466,9 @@ class Device(metaclass=DeviceMeta):
             )
             self.reset(parser, bitstream.timestamp, bitstream.bitfile_name)
 
+    def _axi_port_widths(self, parser):
+        return ()
+
     def set_axi_port_width(self, parser):
         """Set the PS AXI port widths required by the bitstream metadata
 
