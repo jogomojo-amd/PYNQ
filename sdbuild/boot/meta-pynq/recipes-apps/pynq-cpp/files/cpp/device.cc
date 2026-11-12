@@ -28,15 +28,9 @@ Device::Device()
 void Device::write_to_file(const std::string &filename, const std::string &content)
 {
     std::ofstream file(filename);
-    if (file.is_open())
-    {
-        file << content;
-        file.close();
-    }
-    else
-    {
-        std::cout << "Error opening the file" << std::endl;
-    }
+    file << content;
+    file.close();
+    if (!file) throw std::runtime_error("Failed to write " + filename);
 }
 
 void Device::set_bitstream_attrs(const std::string &binfile_name, bool partial)

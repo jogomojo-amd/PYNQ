@@ -1,5 +1,6 @@
 #include <iostream>
 #include <memory>
+#include <limits>
 #include <string>
 #include <fstream>
 #include <sys/mman.h>
@@ -35,6 +36,7 @@
 #include "mmio.h"
 #include "device.h"
 #include "gpio.h"
+#include "extensions.h"
 #ifdef RFSOC
 #include "xrfclk.h"
 #include "xrfdc.h"
@@ -605,6 +607,9 @@ public:
                   << "length=" << request->length()
                   << std::endl;
         #endif
+        const auto page_offset = request->base_addr() & 4095;
+        if (request->length() > std::numeric_limits<size_t>::max() - page_offset)
+            return {grpc::StatusCode::INVALID_ARGUMENT, "MMIO mapping exceeds the target address space"};
         std::string mmio_id = std::to_string(count);
         addMMIO(request->base_addr(), request->length(), mmio_id);
         count += 1;
@@ -895,6 +900,7 @@ class RemoteDeviceImpl final : public RemoteDevice::Service
 private:
     const std::string FIRMWARE = "/lib/firmware/";                               ///< Directory for bitstream files
     Device remote_device_;
+    const pynq_remote::Services* extension_services_ = nullptr;
 #ifdef RFSOC
     XrfdcImpl* xrfdc_service_ = nullptr;   ///< Notified on bitstream download so it can drop its stale RFDC mapping.
     XrfclkImpl* xrfclk_service_ = nullptr; ///< Notified on bitstream download so it can drop its cached clock-device state.
@@ -902,6 +908,9 @@ private:
 
 public:
     std::string device_name = "";
+    void set_extension_services(const pynq_remote::Services& services) {
+        extension_services_ = &services;
+    }
     /**
      * @brief Constructor for RemoteDeviceImpl.
      * Checks if the /lib/firmware/ directory exists and creates it if it does not.
@@ -961,7 +970,10 @@ public:
             file << request.buffer();
         }
         file.close();
-        remote_device_.download(remote_device_.get_bitstream_attrs().first);
+        if (!file) return {grpc::StatusCode::INTERNAL, "Bitstream upload failed"};
+        auto program = [&]() -> Status {
+        if (!remote_device_.download(remote_device_.get_bitstream_attrs().first))
+            return {grpc::StatusCode::NOT_FOUND, "Bitstream file missing"};
 
 #ifdef RFSOC
         // The PL has been reprogrammed, so any cached RFDC/clock state on the
@@ -977,6 +989,12 @@ public:
 #endif
 
         return grpc::Status::OK;
+        };
+        auto status = extension_services_
+            ? pynq_remote::program_overlay(*extension_services_, remote_device_.get_bitstream_attrs().first, program)
+            : program();
+        reply->set_status(status.ok());
+        return status;
     }
     /**
      * @brief Handles the ExistsFile gRPC request.
@@ -1051,6 +1069,25 @@ public:
             return grpc::Status(grpc::StatusCode::INVALID_ARGUMENT, "No file path provided");
         }
 
+        if (request.file_path() == "/sys/class/fpga_manager/fpga0/firmware") {
+            std::string firmware_name;
+            do {
+                firmware_name += request.data();
+                if (firmware_name.size() > 4096)
+                    return {grpc::StatusCode::INVALID_ARGUMENT, "Firmware name is too long"};
+            } while (reader->Read(&request));
+            auto program = [&]() -> Status {
+                std::ofstream manager("/sys/class/fpga_manager/fpga0/firmware");
+                manager << firmware_name;
+                manager.close();
+                if (!manager) return {grpc::StatusCode::INTERNAL, "FPGA programming failed"};
+                return grpc::Status::OK;
+            };
+            return extension_services_
+                ? pynq_remote::program_overlay(*extension_services_, firmware_name, program)
+                : program();
+        }
+
         std::ofstream file(request.file_path(), std::ios::binary);
         if (!file.is_open())
         {
@@ -1089,18 +1126,25 @@ void RunServer(uint16_t port)
 
     grpc::EnableDefaultHealthCheckService(true);
     grpc::reflection::InitProtoReflectionServerBuilderPlugin();
+    auto extension_services = pynq_remote::create_extension_services();
+    remote_device_service.set_extension_services(extension_services);
     ServerBuilder builder;
     builder.AddListeningPort(server_address, grpc::InsecureServerCredentials());
     builder.RegisterService(&remote_device_service); // Add to RPC running server.
     builder.RegisterService(&mmio_service);
     builder.RegisterService(&buffer_service);
     builder.RegisterService(&gpio_service);
+    for (const auto& service : extension_services) {
+        if (!service) throw std::runtime_error("Extension returned a null service");
+        builder.RegisterService(service.get());
+    }
 #ifdef RFSOC
     builder.RegisterService(&xrfclk_service);
     builder.RegisterService(&xrfdc_service);
 #endif
 
     std::unique_ptr<Server> server(builder.BuildAndStart());
+    if (!server) throw std::runtime_error("Could not start PYNQ Remote server");
     std::cout << "Server listening on " << server_address << std::endl;
     // Wait for the server to shutdown. Note that some other thread must be
     // responsible for shutting down the server for this call to ever return.

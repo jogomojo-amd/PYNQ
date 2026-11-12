@@ -1,0 +1,36 @@
+# Copyright (C) 2026 Advanced Micro Devices, Inc.
+# SPDX-License-Identifier: BSD-3-Clause
+
+set(PYNQ_REMOTE_EXTENSION_DIRS "" CACHE STRING "Board service source directories")
+
+function(pynq_remote_add_extension target factory)
+  if(NOT TARGET "${target}" OR NOT factory MATCHES "^[A-Za-z_][A-Za-z0-9_]*$")
+    message(FATAL_ERROR "Expected an existing target and a global service factory name")
+  endif()
+  set_property(GLOBAL APPEND PROPERTY PYNQ_REMOTE_EXTENSION_TARGETS "${target}")
+  set_property(GLOBAL APPEND PROPERTY PYNQ_REMOTE_EXTENSION_FACTORIES "${factory}")
+endfunction()
+
+foreach(extension IN LISTS PYNQ_REMOTE_EXTENSION_DIRS)
+  if(NOT IS_ABSOLUTE "${extension}")
+    message(FATAL_ERROR "Extension source directories must be absolute: ${extension}")
+  endif()
+  string(SHA256 extension_id "${extension}")
+  add_subdirectory("${extension}" "${CMAKE_CURRENT_BINARY_DIR}/extensions/${extension_id}")
+endforeach()
+
+get_property(extension_targets GLOBAL PROPERTY PYNQ_REMOTE_EXTENSION_TARGETS)
+get_property(extension_factories GLOBAL PROPERTY PYNQ_REMOTE_EXTENSION_FACTORIES)
+set(registry "${CMAKE_CURRENT_BINARY_DIR}/extension_services.cc")
+file(WRITE "${registry}" "#include \"extensions.h\"\n#include <iterator>\n")
+foreach(factory IN LISTS extension_factories)
+  file(APPEND "${registry}" "pynq_remote::Services ${factory}();\n")
+endforeach()
+file(APPEND "${registry}" "pynq_remote::Services pynq_remote::create_extension_services() {\nServices services;\n")
+foreach(factory IN LISTS extension_factories)
+  file(APPEND "${registry}" "{ auto group = ::${factory}();\nservices.insert(services.end(), std::make_move_iterator(group.begin()), std::make_move_iterator(group.end())); }\n")
+endforeach()
+file(APPEND "${registry}" "return services;\n}\n")
+target_sources(pynq-remote PRIVATE "${registry}" "${CMAKE_CURRENT_LIST_DIR}/../cpp/extensions.cc")
+target_include_directories(pynq-remote PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
+target_link_libraries(pynq-remote ${extension_targets})

@@ -13,6 +13,9 @@ PACKAGECONFIG[rfsoc] = "-DRFSOC=ON,-DRFSOC=OFF,librfdc libmetal,librfdc libmetal
 
 SRC_URI = "file://cpp/CMakeLists.txt \
            file://cpp/pynq-remote.cc \
+           file://cpp/extensions.cc \
+           file://cpp/extensions.h \
+           file://cmake/extensions.cmake \
            file://cpp/device.cc \
            file://cpp/device.h \
            file://cpp/mmio.cc \

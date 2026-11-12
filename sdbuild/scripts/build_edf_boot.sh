@@ -41,6 +41,12 @@ EDF_MANIFEST_FILE="${EDF_MANIFEST_FILE:-default-edf.xml}"
 EDF_BOOT_MACHINE="${EDF_BOOT_MACHINE:?Set EDF_BOOT_MACHINE in ${BOARD_PATH}/edf.env}"
 EDF_LINUX_MACHINE="${EDF_LINUX_MACHINE:-${EDF_BOOT_MACHINE}}"
 EDF_BOARD_DTS="${EDF_BOARD_DTS:-}"
+case "${ARCH:-aarch64}" in
+    arm) KERNEL_IMAGE="${KERNEL_IMAGE:-zImage}" ;;
+    aarch64) KERNEL_IMAGE="${KERNEL_IMAGE:-Image}" ;;
+    *) echo "Unsupported architecture: ${ARCH}" >&2; exit 1 ;;
+esac
+IMAGE_TYPE="${IMAGE_TYPE:-sd}"
 
 EDF_CACHE="${EDF_CACHE:-${ROOTDIR}/edf-cache}"
 EDF_DIR="${EDF_DIR:-${EDF_CACHE}/pynq-edf}"
@@ -125,6 +131,8 @@ EOF
     else
         echo "  WARN: meta-pynq layer not found at ${META_PYNQ}"
     fi
+    source "${ROOTDIR}/scripts/edf_board_layer.sh"
+    pynq_add_board_layer
 }
 
 # Step 3 (custom mode only): generate a Yocto machine from a board XSA.
@@ -190,19 +198,23 @@ step_build() {
     cd "${BUILDDIR:-${EDF_DIR}/build}"
     # Rebuild the PYNQ-affected boot recipes so source edits apply (sstate can
     # otherwise reuse stale outputs). EDF_NO_CLEAN=1 skips.
-    if [ "${EDF_NO_CLEAN:-0}" != "1" ]; then
+    if [ "${EDF_NO_CLEAN:-0}" != "1" ] && [ "${IMAGE_TYPE}" != ramdisk ]; then
         echo ""; echo "--- cleansstate device-tree / u-boot / bootbin ---"
         MACHINE="${EDF_BOOT_MACHINE}" bitbake -c cleansstate \
             device-tree u-boot-xlnx xilinx-bootbin || true
     fi
     echo ""; echo "--- Step 4: bitbake xilinx-bootbin ---"
-    MACHINE="${EDF_BOOT_MACHINE}" bitbake xilinx-bootbin
+    if [ "${IMAGE_TYPE}" != ramdisk ]; then
+        MACHINE="${EDF_BOOT_MACHINE}" bitbake xilinx-bootbin
+    fi
     echo ""; echo "--- Step 5: bitbake virtual/kernel ---"
     MACHINE="${EDF_BOOT_MACHINE}" bitbake virtual/kernel
     echo ""; echo "--- Step 5b: bitbake zocl (XRT kernel module) ---"
     MACHINE="${EDF_BOOT_MACHINE}" bitbake zocl
     echo ""; echo "--- Step 5c: bitbake kernel-devsrc (on-target build tree) ---"
-    MACHINE="${EDF_BOOT_MACHINE}" bitbake kernel-devsrc
+    if [ "${IMAGE_TYPE}" != ramdisk ]; then
+        MACHINE="${EDF_BOOT_MACHINE}" bitbake kernel-devsrc
+    fi
 }
 
 # Step 6: copy artefacts into $OUTPUT_DIR/<board>/.
@@ -213,22 +225,33 @@ step_extract_artifacts() {
     local board_out="${OUTPUT_DIR}/${BOARD}"
     mkdir -p "${board_out}"
 
-    # BOOT.BIN
+    # A ramdisk can use the board's existing bootloader.
+    if [ "${IMAGE_TYPE}" != ramdisk ]; then
     if [ -f "${deploy}/boot.bin" ]; then cp "${deploy}/boot.bin" "${board_out}/BOOT.BIN"
     elif [ -f "${deploy}/BOOT.BIN" ]; then cp "${deploy}/BOOT.BIN" "${board_out}/BOOT.BIN"
     else echo "ERROR: BOOT.BIN not found in ${deploy}" >&2; ls -la "${deploy}/" 2>/dev/null || true; exit 1; fi
+    fi
 
     # Kernel Image (may be in a sibling deploy dir when boot != linux machine)
     local image_found=false
     for d in "${deploy}" "${linux_deploy}"; do
-        if [ -f "${d}/Image" ]; then cp "${d}/Image" "${board_out}/Image"; image_found=true; break; fi
+        if [ -f "${d}/${KERNEL_IMAGE}" ]; then cp "${d}/${KERNEL_IMAGE}" "${board_out}/${KERNEL_IMAGE}"; image_found=true; break; fi
     done
-    [ "${image_found}" = true ] || { echo "ERROR: kernel Image not found in ${deploy} or ${linux_deploy}" >&2; exit 1; }
+    [ "${image_found}" = true ] || { echo "ERROR: kernel ${KERNEL_IMAGE} not found in ${deploy} or ${linux_deploy}" >&2; exit 1; }
 
+    # Board kernels may supply their own device trees.
+    if [ -n "${EDF_DEVICE_TREE:-}" ]; then
+        for dtb in "${linux_deploy}/"*.dtb; do
+            [ -f "${dtb}" ] && cp -L "${dtb}" "${board_out}/"
+        done
+        cp -L "${linux_deploy}/${EDF_DEVICE_TREE}" "${board_out}/system.dtb"
+    else
     # Device tree (first non-symlink .dtb)
     for dtb in "${deploy}/system.dtb" "${deploy}/"*.dtb; do
         if [ -f "${dtb}" ] && [ ! -L "${dtb}" ]; then cp "${dtb}" "${board_out}/system.dtb"; break; fi
     done
+
+    fi
 
     # Kernel modules tarball
     for mt in "${linux_deploy}/modules-"*.tgz "${deploy}/modules-"*.tgz; do
@@ -306,7 +329,7 @@ EOF
         echo "timeout 3"
         echo "label pynq"
         echo "    menu label PYNQ ${BOARD}"
-        echo "    kernel /Image"
+        echo "    kernel /${KERNEL_IMAGE}"
         echo "    fdt /system.dtb"
         echo "    append ${bootargs}"
     } > "${board_out}/extlinux/extlinux.conf"
@@ -330,7 +353,7 @@ step_write_boot_config() {
                 echo "timeout 3"
                 echo "label pynq"
                 echo "    menu label PYNQ ${BOARD}"
-                echo "    kernel /Image"
+                echo "    kernel /${KERNEL_IMAGE}"
                 echo "    fdt /system.dtb"
             } > "${board_out}/extlinux/extlinux.conf"
             echo "  wrote extlinux/extlinux.conf"
@@ -344,7 +367,7 @@ main() {
     step_setup_custom_bsp
     step_build
     step_extract_artifacts
-    step_write_boot_config
+    if [ "${IMAGE_TYPE}" != ramdisk ]; then step_write_boot_config; fi
     echo ""; echo "============================================"
     echo "EDF boot artefact build complete: ${OUTPUT_DIR}/${BOARD}"
     echo "============================================"

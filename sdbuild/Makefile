@@ -6,6 +6,12 @@
 # board-specific remote packages via REMOTE_PACKAGES_<board> in their .spec file.
 REMOTE_PACKAGES ?= grpc pynq-cpp
 
+# Remote rootfs output; classic images retain the SD-card layout.
+IMAGE_TYPE ?= sd
+ifeq ($(filter $(IMAGE_TYPE),sd ramdisk),)
+$(error IMAGE_TYPE must be sd or ramdisk)
+endif
+
 DEFAULT_BOARDDIR := $(CURDIR)/../boards
 BOARDDIR ?= $(DEFAULT_BOARDDIR)
 
@@ -35,9 +41,9 @@ SYSROOT_ROOT := $(CURDIR)/output/sysroot
 BSP_ROOT := $(CURDIR)/output/bsp
 DIST_ROOT := $(CURDIR)/output/dist
 
-# aarch64 only (Zynq-7000 deprecated). EDF's xilinx-bootbin builds the boot
-# components into BOOT.BIN, so no per-component list is needed.
+# Arm32 is supported for Remote images; classic Zynq-7000 remains deprecated.
 KERNEL_aarch64 := Image
+KERNEL_arm := zImage
 
 export CCACHEDIR
 export ROOTDIR
@@ -122,7 +128,12 @@ BOOT_ROOT_$1 := $$(BOOT_ROOT)/$1
 QEMU_$1 := $$(shell which qemu-$$(ARCH_$1)-static)
 PACKAGE_ENV_$1 := QEMU_EXE=$$(QEMU_$1) PYNQ_BOARDDIR=$$(BOARDDIR_$1) PYNQ_BOARD=$1 FPGA_MANAGER=$$(FPGA_MANAGER_$1) ARCH=$$(ARCH_$1) PACKAGE_PATH=$$(BOARDDIR_$1)/packages PYNQ_SDIST=$$(PYNQ_SDIST) PYNQ_ROOTFS=$$(PYNQ_ROOTFS) BOOT_ROOT=$$(BOOT_ROOT_$1)
 IMAGE_$1 := $$(IMAGE_ROOT)/$1-$$(VERSION).img
+REMOTE_RAMDISK_$1 := $$(IMAGE_ROOT)/$1-$$(VERSION)-remote.cpio.gz
+ifeq ($$(IMAGE_TYPE),ramdisk)
+REMOTE_IMAGE_$1 := $$(if $$(RAMDISK_PACKAGER_$1),$$(IMAGE_ROOT)/$1-$$(VERSION)-remote.$$(RAMDISK_EXTENSION_$1),$$(REMOTE_RAMDISK_$1))
+else
 REMOTE_IMAGE_$1 := $$(IMAGE_ROOT)/$1-$$(VERSION)-remote.img
+endif
 ROOT_$1 := $$(BUILD_ROOT)/$1.tar.gz
 REMOTE_ROOT_$1 := $$(BUILD_ROOT)/$1.remote_rootfs.tar.gz
 SYSROOT_$1 := $$(SYSROOT_ROOT)/$1
@@ -133,20 +144,22 @@ EXTRA_BOOT_$1 := $$(BUILD_ROOT)/$1.extra_boot
 # BOOT.BIN + kernel Image + system.dtb + kernel modules tarball + zocl.ko
 # into output/boot/<board>/, replacing the Petalinux boot-artefact flow.
 BOARD_EDF_ENV_$1 := $$(BOARDDIR_$1)/edf.env
+BOARD_EDF_INPUTS_$1 := $$(shell find $$(BOARDDIR_$1)/edf_bsp -type f 2>/dev/null)
+REMOTE_INPUTS_$1 := $$(shell find $$(ROOTDIR)/boot/meta-pynq -type f) $$(BOARD_EDF_INPUTS_$1) $$(REMOTE_DEPENDS_$1)
 
 BOOT_BIN_$1     := $$(BOOT_ROOT_$1)/BOOT.BIN
-KERNEL_IMAGE_$1 := $$(BOOT_ROOT_$1)/Image
+KERNEL_IMAGE_$1 := $$(BOOT_ROOT_$1)/$$(KERNEL_$$(ARCH_$1))
 SYSTEM_DTB_$1   := $$(BOOT_ROOT_$1)/system.dtb
 MODULES_$1      := $$(BOOT_ROOT_$1)/modules.tgz
 ZOCL_KO_$1      := $$(BOOT_ROOT_$1)/zocl.ko
 KERNEL_DEVSRC_$1 := $$(BOOT_ROOT_$1)/kernel-devsrc.rpm
-BOOT_FILES_$1   := $$(BOOT_BIN_$1) $$(KERNEL_IMAGE_$1) $$(SYSTEM_DTB_$1) $$(MODULES_$1) $$(ZOCL_KO_$1)
-BOOT_STAMP_$1   := $$(BOOT_ROOT_$1)/.boot_built
+BOOT_FILES_$1   := $$(if $$(filter ramdisk,$$(IMAGE_TYPE)),,$$(BOOT_BIN_$1)) $$(KERNEL_IMAGE_$1) $$(SYSTEM_DTB_$1) $$(MODULES_$1) $$(ZOCL_KO_$1)
+BOOT_STAMP_$1   := $$(BOOT_ROOT_$1)/.boot_built$$(if $$(filter ramdisk,$$(IMAGE_TYPE)),-ramdisk,)
 
 BOOT_ENV_$1 := BOARD=$1 BOARD_PATH=$$(BOARDDIR_$1) ARCH=$$(ARCH_$1) \
-	FPGA_MANAGER=$$(FPGA_MANAGER_$1) OUTPUT_DIR=$$(BOOT_ROOT) ROOTDIR=$$(CURDIR)
+	FPGA_MANAGER=$$(FPGA_MANAGER_$1) OUTPUT_DIR=$$(BOOT_ROOT) ROOTDIR=$$(CURDIR) IMAGE_TYPE=$$(IMAGE_TYPE)
 
-$$(BOOT_STAMP_$1): $$(BOARD_EDF_ENV_$1) $$(BITSTREAM_ABS_$1) | $$(BOOT_ROOT_$1)
+$$(BOOT_STAMP_$1): $$(BOARD_EDF_ENV_$1) $$(BOARD_EDF_INPUTS_$1) $$(BITSTREAM_ABS_$1) $$(SCRIPT_DIR)/build_edf_boot.sh $$(SCRIPT_DIR)/edf_board_layer.sh | $$(BOOT_ROOT_$1)
 	$$(BOOT_ENV_$1) $$(SCRIPT_DIR)/build_edf_boot.sh
 	touch $$@
 
@@ -201,12 +214,18 @@ $$(ROOT_$1) : $$(BASE_PATH_$1) $$(BITSTREAM_ABS_$1) $$(STAGE4_DEPENDS_$1) $$(MOD
 	(cd $$(STAGING_$1) && sudo tar -cz * > $$@)
 
 
+# Classic Arm32 PYNQ is deprecated.
+ifeq ($$(ARCH_$1),arm)
+$$(IMAGE_$1):
+	@echo "Classic Arm32 PYNQ is deprecated; use pynqremote_$1" >&2
+	@exit 1
+else
 # Build the SD image (FAT32 boot + ext4 root); see scripts/make_sdimage.sh.
 $$(IMAGE_$1) : $$(ROOT_$1) $$(BOOT_FILES_$1) | $$(IMAGE_ROOT)
-	ROOTFS_TAR=$$(ROOT_$1) BOOT_DIR=$$(BOOT_ROOT_$1) OUT_IMG=$$@ \
+	ROOTFS_TAR=$$(ROOT_$1) BOOT_DIR=$$(BOOT_ROOT_$1) OUT_IMG=$$@ KERNEL_IMAGE=$$(KERNEL_$$(ARCH_$1)) \
 		EXTRA_BOOT=$$(EXTRA_BOOT_$1) \
 		$$(SCRIPT_DIR)/make_sdimage.sh
-
+endif
 
 
 # ---- PYNQ.remote appliance image (EDF/bitbake minimal rootfs) ----
@@ -214,13 +233,24 @@ REMOTE_ENV_$1 := BOARD=$1 BOARD_PATH=$$(BOARDDIR_$1) ARCH=$$(ARCH_$1) \
 	ROOTDIR=$$(CURDIR) REMOTE_ROOTFS_OUT=$$(REMOTE_ROOT_$1) \
 	REMOTE_PACKAGES="$$(REMOTE_PACKAGES) $$(REMOTE_PACKAGES_$1)" RFSoC=$$(RFSoC_$1)
 
-$$(REMOTE_ROOT_$1) : $$(BOARD_EDF_ENV_$1) $$(BOOT_STAMP_$1) | $$(BUILD_ROOT)
+$$(REMOTE_ROOT_$1) : $$(BOARD_EDF_ENV_$1) $$(BOOT_STAMP_$1) $$(REMOTE_INPUTS_$1) $$(SCRIPT_DIR)/build_edf_remote_rootfs.sh | $$(BUILD_ROOT)
 	$$(REMOTE_ENV_$1) $$(SCRIPT_DIR)/build_edf_remote_rootfs.sh
 
+ifeq ($$(IMAGE_TYPE),ramdisk)
+$$(REMOTE_RAMDISK_$1): $$(REMOTE_ROOT_$1) $$(SCRIPT_DIR)/make_ramdisk.sh | $$(IMAGE_ROOT)
+	ROOTFS_TAR=$$(REMOTE_ROOT_$1) OUT_RAMDISK=$$@ $$(SCRIPT_DIR)/make_ramdisk.sh
+
+ifneq ($$(RAMDISK_PACKAGER_$1),)
+$$(REMOTE_IMAGE_$1): $$(REMOTE_RAMDISK_$1) $$(BOOT_FILES_$1) $$(BOARDDIR_$1)/$$(RAMDISK_PACKAGER_$1)
+	ROOTFS_CPIO=$$(REMOTE_RAMDISK_$1) BOOT_DIR=$$(BOOT_ROOT_$1) OUT_IMAGE=$$@ \
+		BOARD_PATH=$$(BOARDDIR_$1) $$(BOARDDIR_$1)/$$(RAMDISK_PACKAGER_$1)
+endif
+else
 $$(REMOTE_IMAGE_$1) : $$(REMOTE_ROOT_$1) $$(BOOT_FILES_$1) | $$(IMAGE_ROOT)
-	ROOTFS_TAR=$$(REMOTE_ROOT_$1) BOOT_DIR=$$(BOOT_ROOT_$1) OUT_IMG=$$@ \
+	ROOTFS_TAR=$$(REMOTE_ROOT_$1) BOOT_DIR=$$(BOOT_ROOT_$1) OUT_IMG=$$@ KERNEL_IMAGE=$$(KERNEL_$$(ARCH_$1)) \
 		ROOT_MARGIN_MB=256 \
 		$$(SCRIPT_DIR)/make_sdimage.sh
+endif
 
 pynqremote_$1: $$(REMOTE_IMAGE_$1)
 	echo "Done building remote image for board $1"

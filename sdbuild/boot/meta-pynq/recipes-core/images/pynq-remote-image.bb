@@ -1,7 +1,8 @@
 SUMMARY = "Minimal PYNQ.remote appliance image (gRPC PL server)"
 LICENSE = "MIT"
 
-IMAGE_INSTALL = "packagegroup-core-boot kernel-modules xrt zocl pynq-cpp pynq-remote-selftest pynq-remote-network ${CORE_IMAGE_EXTRA_INSTALL}"
+PYNQ_REMOTE_XRT_PACKAGE ?= "xrt"
+IMAGE_INSTALL = "packagegroup-core-boot kernel-modules ${PYNQ_REMOTE_XRT_PACKAGE} zocl pynq-cpp pynq-remote-selftest pynq-remote-network ${CORE_IMAGE_EXTRA_INSTALL}"
 IMAGE_FEATURES += "ssh-server-dropbear"
 IMAGE_LINGUAS = " "
 IMAGE_FSTYPES = "tar.gz"

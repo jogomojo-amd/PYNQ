@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# Assemble a bootable ZynqMP SD-card image.
+# Assemble a bootable PYNQ SD-card image.
 #
 # Produces an MBR image with two partitions, matching boot/image.wks:
 #   p1  FAT32  label PYNQ  (bootable)  -- BOOT.BIN + Image + system.dtb + extlinux
@@ -24,11 +24,12 @@ BOOT_DIR="${BOOT_DIR:?BOOT_DIR must be set}"
 OUT_IMG="${OUT_IMG:?OUT_IMG must be set}"
 EXTRA_BOOT="${EXTRA_BOOT:-}"
 BOOT_SIZE_MB="${BOOT_SIZE_MB:-100}"
+KERNEL_IMAGE="${KERNEL_IMAGE:-Image}"
 ROOT_MARGIN_MB="${ROOT_MARGIN_MB:-1024}"
 
 [ -f "${ROOTFS_TAR}" ] || { echo "ERROR: rootfs tarball not found: ${ROOTFS_TAR}" >&2; exit 1; }
 [ -f "${BOOT_DIR}/BOOT.BIN" ] || { echo "ERROR: BOOT.BIN not found in ${BOOT_DIR}" >&2; exit 1; }
-[ -f "${BOOT_DIR}/Image" ]    || { echo "ERROR: Image not found in ${BOOT_DIR}" >&2; exit 1; }
+[ -f "${BOOT_DIR}/${KERNEL_IMAGE}" ]    || { echo "ERROR: ${KERNEL_IMAGE} not found in ${BOOT_DIR}" >&2; exit 1; }
 [ -f "${BOOT_DIR}/system.dtb" ] || { echo "ERROR: system.dtb not found in ${BOOT_DIR}" >&2; exit 1; }
 [ -f "${BOOT_DIR}/extlinux/extlinux.conf" ] || { echo "ERROR: extlinux/extlinux.conf not found in ${BOOT_DIR}" >&2; exit 1; }
 
@@ -122,7 +123,7 @@ if [ -n "${EXTRA_BOOT}" ] && [ -d "${EXTRA_BOOT}" ]; then
 fi
 # Authoritative EDF boot artefacts win over anything from the rootfs /boot.
 sudo cp "${BOOT_DIR}/BOOT.BIN" "${MNT_BOOT}/BOOT.BIN"
-sudo cp "${BOOT_DIR}/Image" "${MNT_BOOT}/Image"
+sudo cp "${BOOT_DIR}/${KERNEL_IMAGE}" "${MNT_BOOT}/${KERNEL_IMAGE}"
 sudo cp "${BOOT_DIR}/system.dtb" "${MNT_BOOT}/system.dtb"
 sudo mkdir -p "${MNT_BOOT}/extlinux"
 sudo cp "${BOOT_DIR}/extlinux/extlinux.conf" "${MNT_BOOT}/extlinux/extlinux.conf"

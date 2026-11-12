@@ -54,6 +54,29 @@ Using the Docker-based build flow
 #. After booting, the ``pynq-remote`` server starts automatically. Use
    ``ip addr`` on the board to find its address, then follow :doc:`quickstart`.
 
+Ramdisk output
+--------------
+
+A ramdisk image runs the remote filesystem in the board's RAM instead of on an
+SD card. Follow the Docker setup above, then add ``IMAGE_TYPE=ramdisk`` to the
+build command:
+
+.. code-block:: bash
+
+   make pynqremote BOARDS=<board_name> IMAGE_TYPE=ramdisk
+
+For boards supplied by a separate repository, also pass
+``BOARDDIR=<board-repository>/boards``. The compressed filesystem is written to
+``sdbuild/output/<BOARD>-4.0.0-remote.cpio.gz``. Some board repositories also
+package it with the kernel and device tree into a bootable image, such as a FIT
+image. Follow the board repository's instructions to load it using the existing
+bootloader.
+
+The board must have enough RAM for the expanded filesystem and the running
+application. If you store the image in flash, check that the compressed image
+fits the available space. Files written to the ramdisk are lost when the board
+reboots.
+
 Image size
 ----------
 

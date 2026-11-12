@@ -1,5 +1,5 @@
 # Copyright (C) 2022 Xilinx, Inc
-# Copyright (C) 2022 - 2026 Advanced Micro Devices, Inc.
+# Copyright (C) 2022-2026 Advanced Micro Devices, Inc.
 # SPDX-License-Identifier: BSD-3-Clause
 
 import os
@@ -182,10 +182,7 @@ class BitstreamHandler:
 
     def is_xsa(self):
         """Returns true if this is an XSA file, false otherwise"""
-        xsa_file = self._filepath.with_suffix(".xsa")
-        if xsa_file.exists():
-            return True
-        return False
+        return self._filepath.suffix.lower() == ".xsa"
 
     def _cache_exists(self)->bool:
         """ Checks to see if this bitstream is already on the system and

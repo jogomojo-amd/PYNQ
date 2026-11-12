@@ -1,0 +1,61 @@
+Subject: [PATCH] Fix 32-bit ELF types and non-AIE edge builds
+
+Upstream-Status: Pending
+
+diff --git a/src/runtime_src/core/common/api/xrt_module.cpp b/src/runtime_src/core/common/api/xrt_module.cpp
+index 7aed7ba34d..c7692f6f38 100644
+--- a/src/runtime_src/core/common/api/xrt_module.cpp
++++ b/src/runtime_src/core/common/api/xrt_module.cpp
+@@ -1400,7 +1400,7 @@ class module_elf_aie2p : public module_elf
+         patch_scheme = static_cast<patcher::symbol_type>(rela->r_addend & schema_mask);
+       }
+ 
+-      std::string argnm{ symname, symname + std::min(strlen(symname), dynstr->get_size()) };
++      std::string argnm{ symname, symname + std::min<uint64_t>(strlen(symname), dynstr->get_size()) };
+       patcher::patch_info pi = patch_scheme == patcher::symbol_type::scalar_32bit_kind
+         // st_size is is encoded using register value mask for scaler_32
+         // for other pacthing scheme it is encoded using size of dma
+@@ -1743,7 +1743,7 @@ class module_elf_aie2ps : public module_elf
+         if (dynstr_offset >= dynstr->get_size())
+           throw std::runtime_error("Invalid symbol name offset " + std::to_string(dynstr_offset));
+         auto symname = dynstr->get_data() + dynstr_offset;
+-        std::string argnm{ symname, symname + std::min(strlen(symname), dynstr->get_size()) };
++        std::string argnm{ symname, symname + std::min<uint64_t>(strlen(symname), dynstr->get_size()) };
+ 
+         // patching can be done to ctrlcode or ctrlpkt section
+         auto patch_sec = m_elfio.sections[sym->st_shndx];
+@@ -1842,7 +1842,7 @@ public:
+     : module_elf{elf}
+     , m_program{elf}
+   {
+-    std::map<uint32_t, std::vector<uint64_t>> pad_offsets;
++    std::map<uint32_t, std::vector<size_t>> pad_offsets;
+     initialize_column_ctrlcode(pad_offsets, ::is_group_elf(xrt_core::elf_int::get_elfio(elf)));
+     initialize_arg_patchers(pad_offsets);
+     initialize_dump_buf();
+diff --git a/src/runtime_src/core/edge/user/hwctx_object.cpp b/src/runtime_src/core/edge/user/hwctx_object.cpp
+index 1d408e259b..0ea6ff205c 100644
+--- a/src/runtime_src/core/edge/user/hwctx_object.cpp
++++ b/src/runtime_src/core/edge/user/hwctx_object.cpp
+@@ -153,13 +153,21 @@ uint64_t
+ hwctx_object::
+ get_aie_freq() const
+ {
++#ifdef XRT_ENABLE_AIE
+  return m_shim->get_aie_freq(this);
++#else
++  throw xrt_core::error(std::errc::not_supported, __func__);
++#endif
+ }
+ 
+ void
+ hwctx_object::
+ set_aie_freq(uint64_t freq_hz) const
+ {
++#ifdef XRT_ENABLE_AIE
+  return m_shim->set_aie_freq(this, freq_hz);
++#else
++  throw xrt_core::error(std::errc::not_supported, __func__);
++#endif
+ }
+ }

@@ -272,3 +272,5 @@ foreach(_target
     ${XRT_LIBRARIES}
     ${XRT_ADDITIONAL_LIBRARIES})  # Link against additional XRT libraries if necessary
 endforeach()
+
+include(../cmake/extensions.cmake)

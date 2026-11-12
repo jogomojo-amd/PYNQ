@@ -1,5 +1,5 @@
-#   Copyright (c) 2016-2021, Xilinx, Inc.
-#   Copyright (C) 2022 - 2026 Advanced Micro Devices, Inc.
+#   Copyright (c) 2016-2022, Xilinx, Inc.
+#   Copyright (C) 2022-2026 Advanced Micro Devices, Inc.
 #   SPDX-License-Identifier: BSD-3-Clause
 
 import os
@@ -422,7 +422,12 @@ class Overlay(Bitstream):
         for i in self.clock_dict:
             if "enable" in self.clock_dict[i]:
                 if self.clock_dict[i]["enable"]:
-                    Clocks.set_pl_clk(i, clk_mhz=self.clock_dict[i]["frequency"])
+                    clock = self.clock_dict[i]
+                    if clock.get("frequency") is None:
+                        Clocks.set_pl_clk(i, div0=clock["divisor0"],
+                                          div1=clock["divisor1"])
+                    else:
+                        Clocks.set_pl_clk(i, clk_mhz=clock["frequency"])
                 else:
                     Clocks.set_pl_clk(i)
 
